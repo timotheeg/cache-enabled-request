@@ -8,88 +8,237 @@ module.exports = request;
 // this only works because we know gthe request module initializes requests as "new request.Request" (see https://github.com/timotheeg/request/blob/master/index.js#L54 )
 // if Request changes its initialization protocol, this would no longer work
 
+// req: no-cache === don't use cache for *this* request, but response *may* still be cached, based on response headers
+// res: max-age=0 / expires past -> must revalidate next round, may still use cache
+// res no-cache -> should not cache
+
+// Internal cache should be a LRU cache
+
 var originalRequest = request.Request;
 
-var cache = {}; // for now, a single in-memory cache for the whole module
+var cache_options = {
+	'default-max-age':       4 * 60 * 60 * 1000, // 4 hours
+	'max-max-age':     30 * 24 * 60 * 60 * 1000, // 30 days
+	'max-size':        2 * 1024 * 1024 * 1024,   // 2 GB, for response bodies only
+};
 
-request.Request = function(options) {
-	if (!options.cache_enabled || options.method !== 'GET') return new originalRequest(options); // everything works per normal, yay!
+var cache_size = 0;
+var cache_by_uri = {}; // for now, a single in-memory cache for the whole module
+var cache_ll_first = null; // aided by a doubly-linked list for lru capability
+var cache_ll_last  = null;
 
-	var req_time = Date.now();
+/* Added API */
+request.getCache = function()
+{
+	return cache_by_uri;
+};
 
-	var entry = cache[options.uri];
+request.getCacheReport = function()
+{
+	// TODO: return cache report
+};
 
-	if (entry) {
-		if (entry.expires_at < req_time) {
-			var revalidate_options = util._extend({}, options);
-			revalidate_options.headers = util._extend({}, options.headers);
-			delete revalidate_options.callback;
+request.Request = function(options)
+{
+	if (!options.cache_on || options.method !== 'GET') return new originalRequest(options); // everything works per standard request, yay!
 
-			// cache stale, must revalidate (may or may not use cache)
-			// must revalidate 
-		}
-		else if (options.callback) {
-			options.callback(null, entry.response, entry.response.body);
-			// TODO: how do we enable piping here?
-			return entry.response.request;
-		}
+	var req_time = Date.now(), entry;
+
+	if (requestAllowsCache(options))
+	{
+		// TODO: Normalize query string?
+		entry = cache[options.uri];
+
+		if (entry)
+		{
+			if (entry.expires_at > req_time)
+			{
+				// ============================
+				// Cache is present and valid
+				// ============================
+
+				// we just return use the cache entry without making a network request
+
+				if (options.callback)
+				{
+					// TODO: defer this call till next tick
+					options.callback(null, entry.response, entry.response.body);
+				}
+
+				setLast(entry);
+
+				// TODO: how to return an object that looks like a request (e.g. allows piping, etc...)?
+				return entry.response.request; // warning, this is a "fake" JSON request
+			}
+			else
+			{
+				// ============================
+				// Cache is expired
+				// ============================
+
+				// if cache contains revalidation options, we will use them 
+				// and handle potential "304 not modified" responses
+
+				if (entry.response.headers['etag']
+				var revalidate_options = util._extend({}, options);
+				revalidate_options.headers = util._extend({}, options.headers);
+				delete revalidate_options.callback;
+
+				// cache stale, must revalidate (may or may not use cache)
+				// must revalidate 
+			}
+			else 
+		}		
 	}
 
 	return (new originalRequest(options)
-		.on('response', function(res) {
-			if (isCacheable(res)) {
-				setCache(res, req_time, options);
+		.on('response', function(res)
+		{
+			if (responseForbidsCache(res.headers)) {
+				clearCache(options.uri);
+				return;
 			}
+
+			setCache(res, req_time, options);
 		})
 	);
 };
 
-// TODO: setInterval to clear the cache entries
+function requestAllowsCache(headers)
+{
+	if (!headers) headers = {};
+	return !/no-cache/i.test(headers['cache-control']);
+}
 
-function isCacheable(options, response) {
-	var req_headers = options.headers || {};
-	var res_headers = response.headers || {};
+function responseForbidsCache(headers)
+{
+	return (headers && /no-cache/i.test(headers['cache-control']);
+}
 
-	if (/no-cache/i.test(req_headers['cache-control'] || '')) return false;
-	if (/no-cache/i.test(res_headers['cache-control'] || '')) return false;
-	if (res_headers['etags']) return true;
-	if (res_headers['expires']) return true;
+function responseAllowsCache(headers)
+{
+	if (!headers) headers = {};
 
+	if (/no-cache/i.test(headers['cache-control'])) return false;
+
+	return responseAllowsRevalidate(headers);
+}
+
+function responseAllowsRevalidate(headers)
+{
+	if (headers)
+	{
+		if (headers['etag']) return true;
+		if (headers['date']) return true;
+	}
 	return false;
 }
 
-function setCache(response, req_time, options) {
-	cache[options.uri] = {
+function setCache(response, req_time, options)
+{
+	var entry = cache[options.uri] = {
 		expires_at: getExpiryTime(response, req_time),
 		response:   response
 	};
+
+	if (!cache_ll_first)
+	{
+		cache_ll_first = cache_ll_last = entry;
+	}
+	else
+	{
+		entry.prev = cache_ll_last;
+		cache_ll_last.next = entry;
+		cache_ll_last = entry;
+	}
+
+	cache_size += (entry.response.body || {length: 0}).length;
+
+	reclaimCache();
 }
 
-function getExpiryTime(response, req_time) {
+function setLast(entry) {
+	if (entry === cache_ll_last) return; // already last
+
+	if (entry.prev) entry.prev.next = entry.next;
+	if (entry.next) entry.next.prev = entry.prev;
+	if (entry === cache_ll_first) cache_ll_first = entry.next;
+
+	entry.prev = cache_ll_last;
+	cache_ll_last.next = entry;
+	cache_ll_last = entry;
+	cache_ll_last.next = null;
+}
+
+function clearCache(uri)
+{
+	var entry;
+
+	if (typeof(uri) === 'object')
+	{
+		entry = uri;
+		uri = entry.response.request.uri;
+	}
+	else {
+		entry = cache_by_uri[uri];
+	}
+
+	if (!entry) return;
+
+	cache_size -= (entry.response.body || {length: 0}).length;
+
+	// clear cache by uri
+	delete cache_by_uri[uri];
+
+	// remove entry from linked list
+	if (cache_ll_first === entry) cache_ll_first = entry.next;
+	if (cache_ll_last  === entry) cache_ll_last  = entry.prev;
+	if (entry.prev) entry.prev.next = entry.next;
+	if (entry.next) entry.next.prev = entry.prev;
+}
+
+function reclaimCache()
+{
+	while (cache_size >= cache_options['max-size'])
+	{
+		clearCache(cache_ll_first);
+	}
+}
+
+function getExpiryTime(response, req_time)
+{
 	var headers = response.headers || {};
 
-	if (headers['cache-control']) {
+	if (headers['cache-control'])
+	{
 		var m = headers['cache-control'].match(/max-age=(-?\d+)/i);
-		if (m) {
+		if (m)
+		{
 			return req_time + parseInt(m[1], 10) * 1000;
 		}
 	}
 
-	if (headers['expires']) {
+	if (headers['expires'])
+	{
 		var origin_expiry, origin_time, origin_offset;
 
-		try {
+		try
+		{
 			origin_expiry = (new Date(headers['expires'])).getTime();
 		}
-		catch(e) {
+		catch(e)
+		{
 			return req_time;
 		}
 
-		if (headers['date']) {
-			try {
+		if (headers['date'])
+		{
+			try
+			{
 				origin_time = (new Date(headers['date'])).getTime();
 			}
-			catch(e) {
+			catch(e)
+			{
 				return origin_expiry;
 			}
 
