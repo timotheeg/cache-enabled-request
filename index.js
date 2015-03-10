@@ -14,12 +14,12 @@ module.exports = request;
 
 // Internal cache should be a LRU cache
 
-var originalRequest = request.Request;
+var OriginalRequest = request.Request;
 
 var cache_options = {
-	'default-max-age':       4 * 60 * 60 * 1000, // 4 hours
-	'max-max-age':     30 * 24 * 60 * 60 * 1000, // 30 days
-	'max-size':        2 * 1024 * 1024 * 1024,   // 2 GB, for response bodies only
+	default_max_age:       4 * 60 * 60 * 1000, // 4 hours
+	max_max_age:     30 * 24 * 60 * 60 * 1000, // 30 days
+	max_size:        1 * 1024 * 1024 * 1024   // 2 GB (for response bodies only)
 };
 
 var cache_size = 0;
@@ -30,7 +30,7 @@ var cache_ll_last  = null;
 /* Added API */
 request.getCache = function()
 {
-	return cache_by_uri;
+	return util._extend({}, cache_by_uri);
 };
 
 request.getCacheReport = function()
@@ -38,16 +38,25 @@ request.getCacheReport = function()
 	// TODO: return cache report
 };
 
+
+/* ======================
+ * Added options
+ * 
+ * cache_on:              if set to true, activates new cache behaviour, otherwise, leaves use request as-is
+ * cache_default_max_age: max-age to compute expiry time if no expires or max-age are supplied in response (default 4h)
+ * cache_forced_max_age:  Ignore response headers and use this value instead
+ * cache_max_size:        maximum character the queries' responses should be alowed to consume
+====================== */
 request.Request = function(options)
 {
-	if (!options.cache_on || options.method !== 'GET') return new originalRequest(options); // everything works per standard request, yay!
+	if (!options.cache_on || options.method !== 'GET') return new OriginalRequest(options); // everything works per standard request, yay!
 
 	var req_time = Date.now(), entry;
 
 	if (requestAllowsCache(options))
 	{
 		// TODO: Normalize query string?
-		entry = cache[options.uri];
+		entry = cache_by_uri[options.uri];
 
 		if (entry)
 		{
@@ -65,7 +74,7 @@ request.Request = function(options)
 					options.callback(null, entry.response, entry.response.body);
 				}
 
-				setLast(entry);
+				setLastUsed(entry);
 
 				// TODO: how to return an object that looks like a request (e.g. allows piping, etc...)?
 				return entry.response.request; // warning, this is a "fake" JSON request
@@ -73,33 +82,76 @@ request.Request = function(options)
 			else
 			{
 				// ============================
-				// Cache is expired
+				// Cache is expired, must revalidate
+				//
+				// if cache contains revalidation options, we will use them
+				// and handle potential "304 not modified" responses
+				//
+				// TODO: how to return a sensible object to the caller here?
+				// TODO: handle cases where caller is not expecting response in callbacks
 				// ============================
 
-				// if cache contains revalidation options, we will use them 
-				// and handle potential "304 not modified" responses
+				var revalidate_headers = {}, can_revalidate = false;
 
-				if (entry.response.headers['etag']
-				var revalidate_options = util._extend({}, options);
-				revalidate_options.headers = util._extend({}, options.headers);
-				delete revalidate_options.callback;
+				if (entry.response.headers['etag'])
+				{
+					revalidate_headers['If-None-match'] = entry.response.headers['etag'];
+					can_revalidate = true;
+				}
+				if (entry.response.headers['date'])
+				{
+					revalidate_headers['If-Modified-Since'] = entry.response.headers['date'];
+					can_revalidate = true;
+				}
 
-				// cache stale, must revalidate (may or may not use cache)
-				// must revalidate 
+				if (can_revalidate)
+				{
+					options.headers = util._extend(revalidate_headers, options.headers);
+
+					var original_callback = options.callback;
+
+					options.callback = function(err, res, body)
+					{
+						if (err) return original_callback(err, res, body);
+
+						if (res.statusCode === 304)
+						{
+							// cache is still good! Update entry fields per latest response headers
+							updateCache(entry, res, req_time, options);
+
+							// mangle response to suply cached version to caller
+							original_callback(err, entry.response, entry.response.body);
+						}
+						else
+						{
+							if (responseForbidsCache(res.headers)) {
+								clearCache(options.uri);
+							}
+							else if (res.statusCode == 200)
+							{
+								setCache(res, req_time, options);
+							}
+
+							original_callback(err, res, body);
+						}
+					};
+
+					return new OriginalRequest(options);
+				}
 			}
-			else 
-		}		
+		}
 	}
 
-	return (new originalRequest(options)
+	return (new OriginalRequest(options)
 		.on('response', function(res)
 		{
 			if (responseForbidsCache(res.headers)) {
 				clearCache(options.uri);
-				return;
 			}
-
-			setCache(res, req_time, options);
+			else if (res.statusCode == 200)
+			{
+				setCache(res, req_time, options);
+			}
 		})
 	);
 };
@@ -112,7 +164,7 @@ function requestAllowsCache(headers)
 
 function responseForbidsCache(headers)
 {
-	return (headers && /no-cache/i.test(headers['cache-control']);
+	return (headers && /no-cache/i.test(headers['cache-control']));
 }
 
 function responseAllowsCache(headers)
@@ -136,29 +188,44 @@ function responseAllowsRevalidate(headers)
 
 function setCache(response, req_time, options)
 {
-	var entry = cache[options.uri] = {
-		expires_at: getExpiryTime(response, req_time),
-		response:   response
+	clearCache(options.uri);
+
+	var entry = cache_by_uri[options.uri] = {
+		expires_at: getExpiryTime(response, req_time, options),
+		response:   response.toJSON()
 	};
 
-	if (!cache_ll_first)
-	{
-		cache_ll_first = cache_ll_last = entry;
-	}
-	else
-	{
-		entry.prev = cache_ll_last;
-		cache_ll_last.next = entry;
-		cache_ll_last = entry;
-	}
+	setLastUsed(entry);
 
 	cache_size += (entry.response.body || {length: 0}).length;
 
 	reclaimCache();
 }
 
-function setLast(entry) {
+// this function is called when a response is a 304 onto an existing cache entry
+var to_update = ['etag', 'expires', 'date', 'last-modified', 'cache-control'];
+function updateCache(entry, response, req_time, options)
+{
+	entry.expires_at = getExpiryTime(response, req_time, options);
+
+	to_update.forEach(function(header_name)
+	{
+		if (response.headers[header_name]) entry.response.headers[header_name] = response.headers[header_name];
+	});
+
+	setLastUsed(entry);
+}
+
+function setLastUsed(entry) {
 	if (entry === cache_ll_last) return; // already last
+
+	if (!cache_ll_first)
+	{
+		// first entry being added to linked list
+		entry.prev = entry.next = null;
+		cache_ll_first = cache_ll_last = entry;
+		return;
+	}
 
 	if (entry.prev) entry.prev.next = entry.next;
 	if (entry.next) entry.next.prev = entry.prev;
@@ -199,14 +266,20 @@ function clearCache(uri)
 
 function reclaimCache()
 {
-	while (cache_size >= cache_options['max-size'])
+	while (cache_size >= cache_options.max_size)
 	{
 		clearCache(cache_ll_first);
 	}
 }
 
-function getExpiryTime(response, req_time)
+function getExpiryTime(response, req_time, options)
 {
+	// if forced_max_age is supplied, we use that
+	if (typeof(options.cache_forced_max_age) === 'number')
+	{
+		return req_time + options.cache_forced_max_age;
+	}
+
 	var headers = response.headers || {};
 
 	if (headers['cache-control'])
@@ -246,7 +319,15 @@ function getExpiryTime(response, req_time)
 
 			return origin_expiry - origin_offset; // return expiry time taking offset into account
 		}
+
+		return origin_expiry;
 	}
 
-	return req_time; // no usable information
+	// allows caller to set whatever default expiry they wish
+	if (typeof(options.cache_default_max_age) === 'number')
+	{
+		return req_time + options.cache_default_max_age;
+	}
+
+	return req_time + cache_options.default_max_age;
 }
